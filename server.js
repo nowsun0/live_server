@@ -8,27 +8,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── 구글시트 ID (환경변수로 관리) ───────────────────────────
-const ID_AUTH_SHEET_ID = process.env.SHEET_ID_AUTH;  // ID 인증 시트 ID
+// ── 환경변수 ─────────────────────────────────────────────────
+const ID_AUTH_SHEET_ID = process.env.SHEET_ID_AUTH;
 const GROQ_URL         = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL       = 'llama-3.1-8b-instant';
 
-// ── 시트 URL 생성 헬퍼 ───────────────────────────────────────
-function sheetTsvUrl(sheetUrl, gid) {
-  const idMatch = sheetUrl.match(/\/spreadsheets\/d\/([^/]+)/);
-  if (!idMatch) return null;
-  return `https://docs.google.com/spreadsheets/d/${idMatch[1]}/export?format=tsv&gid=${gid || '0'}`;
+// ── URL 변환 헬퍼 ─────────────────────────────────────────────
+function extractSheetInfo(url) {
+  const idMatch  = url.match(/\/spreadsheets\/d\/([^/]+)/);
+  const gidMatch = url.match(/gid=(\d+)/);
+  return {
+    id:  idMatch  ? idMatch[1]  : null,
+    gid: gidMatch ? gidMatch[1] : '0'
+  };
 }
 
-function sheetCsvUrl(sheetUrl, gid) {
-  const idMatch = sheetUrl.match(/\/spreadsheets\/d\/([^/]+)/);
-  if (!idMatch) {
-    // URL이 아닌 순수 ID인 경우
-    return `https://docs.google.com/spreadsheets/d/${sheetUrl}/export?format=csv&gid=${gid || '0'}`;
-  }
-  const gidMatch = sheetUrl.match(/gid=(\d+)/);
-  const finalGid = gid || (gidMatch ? gidMatch[1] : '0');
-  return `https://docs.google.com/spreadsheets/d/${idMatch[1]}/export?format=csv&gid=${finalGid}`;
+function toTsvUrl(url) {
+  const { id, gid } = extractSheetInfo(url);
+  if (!id) return null;
+  return `https://docs.google.com/spreadsheets/d/${id}/export?format=tsv&gid=${gid}`;
+}
+
+function toCsvUrl(url) {
+  const { id, gid } = extractSheetInfo(url);
+  if (!id) return null;
+  return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
 }
 
 // ── 파싱 유틸 ────────────────────────────────────────────────
@@ -86,7 +90,10 @@ function cleanAnswer(raw) {
 
 // ── 스펙 데이터 파싱 ─────────────────────────────────────────
 async function parseSpecData(specUrl) {
-  const res      = await fetch(specUrl);
+  const tsvUrl   = toTsvUrl(specUrl);
+  if (!tsvUrl) throw new Error('잘못된 스펙 URL: ' + specUrl);
+
+  const res      = await fetch(tsvUrl);
   const specText = await res.text();
   const { headers: specHeaders, rows: specRows } = parseTSV(specText);
   const giftCols = specHeaders.filter(h => h.startsWith('사은품'));
@@ -129,7 +136,10 @@ async function parseSpecData(specUrl) {
 }
 
 // ── 키워드 파싱 ──────────────────────────────────────────────
-async function parseKeywords(csvUrl) {
+async function parseKeywords(url) {
+  const csvUrl = toCsvUrl(url);
+  if (!csvUrl) throw new Error('잘못된 키워드 URL: ' + url);
+
   const res  = await fetch(csvUrl);
   const text = await res.text();
   const rows = text.trim().split('\n').slice(1);
@@ -152,7 +162,6 @@ app.get("/", (req, res) => {
 });
 
 // ── POST /verifyId ───────────────────────────────────────────
-// ID 인증 시트에서 ID 확인 후 해당 ID의 모든 시트 URL 반환
 app.post("/verifyId", async (req, res) => {
   try {
     const { id } = req.body;
@@ -168,7 +177,7 @@ app.post("/verifyId", async (req, res) => {
       const sheetId = (cols[0] || '').trim();
       if (sheetId !== id) continue;
 
-      // 시트 컬럼 구조:
+      // 컬럼 구조:
       // 0: 라이브ID
       // 1: 댓글 대응 프롬프트 주소 (키워드_네이버)
       // 2: 시스템 지침 주소
@@ -194,12 +203,12 @@ app.post("/verifyId", async (req, res) => {
     res.json({ ok: false, error: '잘못된 ID' });
 
   } catch(e) {
+    console.error('[verifyId 오류]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ── POST /getSpec ─────────────────────────────────────────────
-// urls.naverSpec 또는 urls.spec11st URL로 스펙 데이터 반환
 app.post("/getSpec", async (req, res) => {
   try {
     const { specUrl, systemPromptUrl } = req.body;
@@ -209,38 +218,41 @@ app.post("/getSpec", async (req, res) => {
     let systemPrompt = '';
     if (systemPromptUrl) {
       try {
-        const sysRes   = await fetch(systemPromptUrl);
+        const tsvUrl   = toTsvUrl(systemPromptUrl);
+        const sysRes   = await fetch(tsvUrl);
         const sysText  = await sysRes.text();
         const sysLines = sysText.split('\n')
           .map(l => l.split('\t')[0].replace(/\r/g,'').replace(/^"|"$/g,'').trim())
           .filter(l => l);
         systemPrompt = sysLines.join('\n');
-      } catch(e) {}
+      } catch(e) {
+        console.error('[시스템 지침 로딩 실패]', e.message);
+      }
     }
 
     // 스펙 데이터 로딩
     const { specContext, modelMap, groupMap } = await parseSpecData(specUrl);
 
+    console.log('[getSpec 완료] 스펙:', specContext.length + '자, 모델:', Object.keys(modelMap).length + '개');
     res.json({ ok: true, specContext, modelMap, groupMap, systemPrompt });
 
   } catch(e) {
+    console.error('[getSpec 오류]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ── POST /getSheetData ───────────────────────────────────────
-// urls.keyword 또는 urls.kwMatch11st URL로 키워드 반환
 app.post("/getSheetData", async (req, res) => {
   try {
     const { sheetUrl } = req.body;
     if (!sheetUrl) return res.json({ ok: false, error: 'sheetUrl 필요' });
 
-    const csvUrl  = sheetCsvUrl(sheetUrl);
-    const keywords = await parseKeywords(csvUrl);
-
+    const keywords = await parseKeywords(sheetUrl);
     res.json({ ok: true, keywords });
 
   } catch(e) {
+    console.error('[getSheetData 오류]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -279,6 +291,7 @@ app.post("/askAI", async (req, res) => {
     res.json({ ok: true, answer });
 
   } catch(e) {
+    console.error('[askAI 오류]', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -286,5 +299,5 @@ app.post("/askAI", async (req, res) => {
 // ── 서버 시작 ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Server running on ' + PORT);
+  console.log('Live AI Server running on port ' + PORT);
 });
