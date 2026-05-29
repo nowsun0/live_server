@@ -279,7 +279,7 @@ app.post("/askAI", async (req, res) => {
         ],
         max_tokens: 300,
         temperature: 0.1,
-        stop: ['시청자 질문:', '[질문]', '[데이터]']
+       
       })
     });
 
