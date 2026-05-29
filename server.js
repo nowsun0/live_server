@@ -284,6 +284,7 @@ app.post("/askAI", async (req, res) => {
     });
 
     const data   = await response.json();
+    console.log('[Groq전체응답]', JSON.stringify(data));
     const raw    = (data.choices?.[0]?.message?.content || '').trim();
     const answer = cleanAnswer(raw);
 
